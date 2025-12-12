@@ -6,12 +6,12 @@
 
 set -o pipefail
 
-# Color codes for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# Color codes for output (use ANSI escape bytes so terminals render colors)
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+NC=$'\033[0m' # No Color
 
 # Function to display explanations of health parameters
 explain_parameters() {
@@ -112,12 +112,37 @@ EOF
 get_cpu_usage() {
     local cpu_usage
     # Get CPU usage from /proc/stat (average across all cores)
-    cpu_usage=$(awk '/^cpu / {
-        user=$2; nice=$3; system=$4; idle=$5;
-        total=user+nice+system+idle;
-        printf "%.1f", (100 * (total-idle) / total)
-    }' /proc/stat 2>/dev/null)
-    
+    # Sample /proc/stat twice over a short interval to compute usage delta
+    local stat1 stat2
+    stat1=$(awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8,$9; exit}' /proc/stat 2>/dev/null)
+    sleep 0.5
+    stat2=$(awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8,$9; exit}' /proc/stat 2>/dev/null)
+
+    if [ -z "$stat1" ] || [ -z "$stat2" ]; then
+        echo "N/A"
+        return
+    fi
+
+    read -r u1 n1 s1 i1 w1 irq1 soft1 steal1 <<< "$stat1"
+    read -r u2 n2 s2 i2 w2 irq2 soft2 steal2 <<< "$stat2"
+
+    u1=${u1:-0}; n1=${n1:-0}; s1=${s1:-0}; i1=${i1:-0}; w1=${w1:-0}; irq1=${irq1:-0}; soft1=${soft1:-0}; steal1=${steal1:-0}
+    u2=${u2:-0}; n2=${n2:-0}; s2=${s2:-0}; i2=${i2:-0}; w2=${w2:-0}; irq2=${irq2:-0}; soft2=${soft2:-0}; steal2=${steal2:-0}
+
+    total1=$((u1 + n1 + s1 + i1 + w1 + irq1 + soft1 + steal1))
+    total2=$((u2 + n2 + s2 + i2 + w2 + irq2 + soft2 + steal2))
+    idle1=$((i1 + w1))
+    idle2=$((i2 + w2))
+
+    diff_total=$((total2 - total1))
+    diff_idle=$((idle2 - idle1))
+
+    if [ "$diff_total" -le 0 ]; then
+        echo "N/A"
+        return
+    fi
+
+    cpu_usage=$(awk -v dt="$diff_total" -v di="$diff_idle" 'BEGIN{ printf "%.1f", 100*(dt-di)/dt }')
     echo "${cpu_usage:-N/A}"
 }
 
@@ -159,6 +184,17 @@ get_system_uptime() {
     echo "${days}d ${hours}h ${minutes}m"
 }
 
+# Function to get uptime in days (integer)
+get_uptime_days() {
+    local uptime_seconds
+    uptime_seconds=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
+    if [ -z "$uptime_seconds" ]; then
+        echo "N/A"
+        return
+    fi
+    echo $((uptime_seconds / 86400))
+}
+
 # Function to get load average
 get_load_average() {
     local load_avg
@@ -179,21 +215,26 @@ get_status_color() {
     local value=$1
     local warning_threshold=$2
     local critical_threshold=$3
-    
-    # Check if value is a number
-    if ! [[ "$value" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+
+    # Check if value is a number (integer or float)
+    if ! [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         echo -e "${BLUE}?"
         return
     fi
-    
-    # Compare values
-    if (( $(echo "$value >= $critical_threshold" | bc -l) )); then
-        echo -e "${RED}✗"
-    elif (( $(echo "$value >= $warning_threshold" | bc -l) )); then
-        echo -e "${YELLOW}⚠"
-    else
-        echo -e "${GREEN}✓"
-    fi
+
+    # Use awk for float comparison to avoid requiring 'bc'
+    local cmp
+    cmp=$(awk -v v="$value" -v w="$warning_threshold" -v c="$critical_threshold" 'BEGIN {
+        if (v >= c) print "critical";
+        else if (v >= w) print "warning";
+        else print "ok";
+    }')
+
+    case "$cmp" in
+        critical) echo -e "${RED}✗" ;;
+        warning)  echo -e "${YELLOW}⚠" ;;
+        *)        echo -e "${GREEN}✓" ;;
+    esac
 }
 
 # Function to display health check results
@@ -204,12 +245,14 @@ display_health_check() {
     local uptime=$(get_system_uptime)
     local load_avg=$(get_load_average)
     local cpu_cores=$(get_cpu_cores)
+    local uptime_days=$(get_uptime_days)
     
     local cpu_status=$(get_status_color "$cpu_usage" 70 90)
     local mem_status=$(get_status_color "$mem_usage" 80 95)
     local disk_status=$(get_status_color "$disk_usage" 85 95)
     local load_1=$(echo "$load_avg" | cut -d',' -f1)
     local load_status=$(get_status_color "$load_1" "$cpu_cores" "$((cpu_cores * 2))")
+    local uptime_status=$(get_status_color "$uptime_days" 30 90)
     
     cat << EOF
 ${BLUE}═══════════════════════════════════════════════════════════════${NC}
@@ -225,9 +268,9 @@ ${BLUE}Health Parameters:${NC}
 
   ${cpu_status} CPU Usage         : ${cpu_usage}%
   ${mem_status} Memory Usage      : ${mem_usage}%
-  ${disk_status} Disk Usage        : ${disk_usage}%
-  System Uptime     : $uptime
-  ${load_status} Load Average      : $load_avg
+    ${disk_status} Disk Usage        : ${disk_usage}%
+    ${uptime_status} System Uptime     : $uptime
+    ${load_status} Load Average      : $load_avg
     (1m, 5m, 15m average - system has $cpu_cores cores)
 
 ${BLUE}Status Legend:${NC}
@@ -244,22 +287,57 @@ EOF
 
 # Main script logic
 main() {
-    # Check if help/explain argument is provided
-    case "${1,,}" in
+    # Normalize first argument
+    local cmd="${1,,}"
+
+    case "$cmd" in
         explain|--explain|-e|help|--help|-h)
             explain_parameters
+            echo
+            display_health_check
             ;;
-        "")
-            # No arguments - show health check
+        watch|-w|--watch)
+            # watch [interval_seconds] [count]
+            local interval=${2:-2}
+            local count=${3:-0} # 0 means infinite
+
+            # Validate interval
+            if ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -le 0 ]; then
+                echo -e "${RED}Error: interval must be a positive integer${NC}"
+                exit 1
+            fi
+
+            # Validate count
+            if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 0 ]; then
+                echo -e "${RED}Error: count must be a non-negative integer${NC}"
+                exit 1
+            fi
+
+            local i=0
+            trap 'echo; echo "Interrupted."; exit 0' SIGINT SIGTERM
+            while true; do
+                clear
+                display_health_check
+                i=$((i+1))
+                if [ "$count" -ne 0 ] && [ "$i" -ge "$count" ]; then
+                    break
+                fi
+                sleep "$interval"
+            done
+            ;;
+        "" )
+            # No arguments - show single health check
             display_health_check
             ;;
         *)
             echo -e "${RED}Error: Unknown argument '$1'${NC}"
-            echo "Usage: $0 [explain]"
+            echo "Usage: $0 [explain] | $0 watch [interval_seconds] [count]"
             echo ""
             echo "Examples:"
-            echo "  $0           # Display health check report"
-            echo "  $0 explain   # Display detailed parameter explanations"
+            echo "  $0                       # Display health check report"
+            echo "  $0 explain               # Display detailed parameter explanations"
+            echo "  $0 watch 2               # Refresh every 2s until interrupted"
+            echo "  $0 watch 1 10            # Refresh every 1s for 10 iterations"
             exit 1
             ;;
     esac
